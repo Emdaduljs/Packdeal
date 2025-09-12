@@ -41,23 +41,37 @@ def apply_texture(design: Image.Image, template: str) -> Image.Image:
         canvas = Image.alpha_composite(canvas, shadow)
 
     else:
-        # Gift Box - place design on front face of box
+        # Gift Box - place design on front face of box (robust rectangle drawing)
         box_origin = (300, 200)
         box_size = (600, 400)
-        # Draw box rectangle
+        x0, y0 = box_origin
+        x1, y1 = x0 + box_size[0], y0 + box_size[1]
+
         draw = ImageDraw.Draw(canvas)
-        draw.rectangle([box_origin, (box_origin[0]+box_size[0], box_origin[1]+box_size[1])], outline=(180,180,180,255), width=4)
+        outline_color = (180, 180, 180)   # safer 3-tuple RGB
+        border_width = 4
+
+        # Try the simple rectangle call (may fail on older Pillow versions)
+        try:
+            # some Pillow versions accept width; others will raise TypeError
+            draw.rectangle([(x0, y0), (x1, y1)], outline=outline_color, width=border_width)
+        except TypeError:
+            # Fallback for Pillow versions that don't support 'width':
+            # draw multiple concentric rectangles to simulate border thickness.
+            for i in range(border_width):
+                draw.rectangle([(x0+i, y0+i), (x1-i, y1-i)], outline=outline_color)
+
         # Map design to box face
         face = mapping.map_to_label(design, box_size)
         face_pos = box_origin
-        # Paste RGBA face using its own alpha channel as mask
+        # Paste RGBA face using its alpha channel as mask (robust)
         canvas.paste(face, face_pos, face)
 
-        # Add ribbon (simple)
+        # Add ribbon (simple) using RGB tuples
         rdraw = ImageDraw.Draw(canvas)
-        rx = box_origin[0] + box_size[0]//2
-        rdraw.rectangle([rx-10, box_origin[1], rx+10, box_origin[1]+box_size[1]], fill=(200,30,30,255))
-        rdraw.rectangle([box_origin[0], box_origin[1]+box_size[1]//2-10, box_origin[0]+box_size[0], box_origin[1]+box_size[1]//2+10], fill=(200,30,30,255))
+        rx = x0 + box_size[0]//2
+        rdraw.rectangle([rx-10, y0, rx+10, y1], fill=(200,30,30))
+        rdraw.rectangle([x0, y0+box_size[1]//2-10, x1, y0+box_size[1]//2+10], fill=(200,30,30))
 
     # Convert back to RGB for display/export
     return canvas.convert('RGB')
