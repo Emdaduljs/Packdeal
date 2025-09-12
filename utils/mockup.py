@@ -1,10 +1,11 @@
 from PIL import Image
 from . import render
+import os
 
 def generate_mockup(design: Image.Image, template: str) -> Image.Image:
     """
-    Generate a simple mockup by applying the design as a label/skin on a template.
-    This is a 2D compositing approximation meant for an MVP.
+    Generate a mockup.
+    `template` may be a builtin name (e.g., "Water Bottle") or a filesystem path
+    to a 3D model (models/*.glb, models/*.obj, etc.). Render will handle both cases.
     """
-    # delegate to render.apply_texture which returns an RGB image
     return render.apply_texture(design, template)
