@@ -214,7 +214,6 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
 
     text_nodes = list(root.findall(".//{http://www.w3.org/2000/svg}text")) + list(root.findall(".//text"))
 
-    xlink_ns = "http://www.w3.org/1999/xlink"
     added_xlink = False
 
     for text_elem in text_nodes:
@@ -224,10 +223,7 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
         if not matches:
             continue
 
-        # We'll build the replacement content or element per match
-        # If multiple placeholders appear in same text element, we handle each sequentially:
-        # For barcode A: we replace the entire text element with a single <image> (best-effort).
-        # If multiple placeholders and any is Barcode we fallback to text substitution for others.
+        # Determine if any of the placeholders in this element is set to Barcode
         is_barcode_mode = any(mapping.get(ph, {}).get("type", "Text") == "Barcode (EAN13)" for ph in matches)
 
         if is_barcode_mode and len(matches) == 1:
@@ -240,7 +236,6 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 val = ""
             # if empty value, leave empty text
             if str(val).strip() == "":
-                # remove children and set empty text
                 for child in list(text_elem):
                     text_elem.remove(child)
                 text_elem.text = ""
@@ -281,7 +276,6 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 # replace text_elem with img_el
                 parent = text_elem.getparent()
                 if parent is None:
-                    # can't replace, fallback to setting empty text and append image sibling
                     text_elem.text = ""
                     parent = text_elem.getparent()
                     if parent is not None:
@@ -289,10 +283,8 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 else:
                     parent.replace(text_elem, img_el)
 
-                # remember to ensure xmlns:xlink on root later
                 added_xlink = True
             except Exception as e:
-                # generation failed -> keep text but insert error marker
                 for child in list(text_elem):
                     text_elem.remove(child)
                 text_elem.text = f"[barcode error: {e}]"
@@ -540,7 +532,7 @@ with right_col:
     if not sanitized_template:
         preview_box.info("Upload a valid SVG template first.")
     elif df is None or df.empty:
-        preview_box.info("Upload a data file (CSV/XML) and map placeholders to preview.)
+        preview_box.info("Upload a data file (CSV/XML) and map placeholders to preview.")
     elif not st.session_state.get("mapping"):
         preview_box.info("Map placeholders to see a live preview.")
     else:
