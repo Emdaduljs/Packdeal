@@ -1,5 +1,5 @@
-# app.py  (UPDATED — EAN-13 barcode embedding support)
-﻿# app.py
+# app.py
+# -*- coding: utf-8 -*-
 import io
 import os
 import re
@@ -540,7 +540,7 @@ with right_col:
     if not sanitized_template:
         preview_box.info("Upload a valid SVG template first.")
     elif df is None or df.empty:
-        preview_box.info("Upload a data file (CSV/XML) and map placeholders to preview.")
+        preview_box.info("Upload a data file (CSV/XML) and map placeholders to preview.)
     elif not st.session_state.get("mapping"):
         preview_box.info("Map placeholders to see a live preview.")
     else:
