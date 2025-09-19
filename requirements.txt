@@ -1,2 +1,9 @@
-streamlit==1.29.0
-Pillow>=9.4.0
+streamlit>=1.30,<2.0
+pandas>=2.1
+pillow==10.0.1
+PyMuPDF>=1.22
+reportlab>=4.0
+cairosvg==2.7.0
+lxml>=4.9
+pikepdf>=9.2
+PyPDF2>=3.0
