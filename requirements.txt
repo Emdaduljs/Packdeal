@@ -1,3 +1,6 @@
-streamlit
-pillow
-reportlab
+streamlit==1.29.0
+pandas==2.1.0
+Pillow==10.0.0
+python-barcode==0.14
+reportlab==4.1.0
+zipfile36==0.1.3
