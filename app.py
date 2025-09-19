@@ -1,23 +1,21 @@
 # app.py
 # -*- coding: utf-8 -*-
 import io
-import os
 import re
 import json
 import base64
 import zipfile
 from pathlib import Path
-import math
 import pandas as pd
 import streamlit as st
 from lxml import etree
 import cairosvg
 
-# barcode helpers (we'll use python-barcode directly here)
+# barcode generation (vector) via python-barcode
 import barcode
 from barcode.writer import SVGWriter
 
-# your utils (we still use mm_to_px if present)
+# keep using utils.mm_to_px
 import utils
 from PIL import Image as PILImage
 
@@ -32,7 +30,7 @@ st.set_page_config(page_title=APP_TITLE,
                    layout="wide")
 st.title(APP_TITLE)
 
-# ---------- Utility: embed background images via CSS ----------
+# ---------- Utility CSS ----------
 def _b64_if_exists(path: str):
     p = Path(path)
     if not p.exists():
@@ -76,7 +74,7 @@ custom_css += """
 custom_css += "</style>"
 st.markdown(custom_css, unsafe_allow_html=True)
 
-# ---------- Auth (simple) ----------
+# ---------- Simple auth ----------
 USERS = {"Emdaduljs": "123", "Test1": "1234", "Test2": "12345", "Test3": "123456"}
 
 with st.sidebar:
@@ -91,7 +89,7 @@ with st.sidebar:
     role = "Editor" if username == "Emdaduljs" else "User"
     st.success(f"✅ {role} ({username})")
 
-# ---------- Helpers & SVG sanitization ----------
+# ---------- Helpers & sanitization ----------
 SVG_NS = "http://www.w3.org/2000/svg"
 
 def _decode_bytes(b: bytes) -> str:
@@ -125,7 +123,6 @@ def sanitize_for_preview(svg_bytes: bytes) -> str:
         else:
             raise
 
-    # ensure <svg>
     if not (isinstance(root.tag, str) and root.tag.lower().endswith("svg")):
         cand = root.find(".//{http://www.w3.org/2000/svg}svg") or root.find(".//svg")
         if cand is not None:
@@ -145,7 +142,6 @@ def sanitize_for_preview(svg_bytes: bytes) -> str:
     if "version" not in root.attrib:
         root.set("version", "1.1")
 
-    # ensure viewBox if missing
     if "viewBox" not in root.attrib:
         w = root.get("width"); h = root.get("height")
         if w and h:
@@ -156,7 +152,6 @@ def sanitize_for_preview(svg_bytes: bytes) -> str:
             except Exception:
                 pass
 
-    # normalize inline style
     for el in root.iter():
         style = el.get("style")
         if style:
@@ -189,7 +184,7 @@ def svg_to_pdf_bytes(svg_text: str) -> bytes:
     svg_text = ensure_svg_size(svg_text)
     return cairosvg.svg2pdf(bytestring=svg_text.encode("utf-8"))
 
-# ---------- Helper: parse svg dims ----------
+# ---------- parse svg dims ----------
 def _parse_svg_dimensions(svg_text: str):
     try:
         parser = etree.XMLParser(ns_clean=True, recover=True, remove_blank_text=True)
@@ -229,12 +224,8 @@ def _parse_svg_dimensions(svg_text: str):
         pass
     return 1000.0, 1000.0
 
-# ---------- Helper: generate EAN-13 SVG string (robust) ----------
+# ---------- reliable EAN-13 SVG generator ----------
 def render_ean13_svg_text(ean: str) -> str:
-    """
-    Generate an SVG string for the given EAN (12 or 13 digits) using python-barcode's SVGWriter.
-    Returns the raw SVG text (utf-8 string).
-    """
     ean_clean = ''.join(filter(str.isdigit, str(ean)))
     if len(ean_clean) not in (12, 13):
         raise ValueError("EAN must be 12 or 13 digits")
@@ -242,7 +233,6 @@ def render_ean13_svg_text(ean: str) -> str:
     writer = SVGWriter()
     obj = EAN(ean_clean, writer=writer)
     buf = io.BytesIO()
-    # Try writing without human-readable text (if you prefer show text, remove the option)
     options = {"write_text": True}
     obj.write(buf, options)
     buf.seek(0)
@@ -252,18 +242,10 @@ def render_ean13_svg_text(ean: str) -> str:
         svg_text = buf.getvalue().decode("latin-1")
     return svg_text
 
-# ---------- placeholders mapping ----------
-def find_placeholders(svg_text: str):
-    return sorted(set(re.findall(r"\{\{\s*([A-Za-z0-9_\-\.]+)\s*\}\}", svg_text)))
-
+# ---------- conservative white rect remover ----------
 def _remove_white_background_rects(frag_root):
-    """
-    Remove rect elements that appear to be white background covering the viewport.
-    Conservative: remove rects with white-ish fill or very large dims.
-    """
     to_remove = []
     for el in list(frag_root.iter()):
-        # tag check handles namespace like {http://...}rect
         tag = el.tag
         if not isinstance(tag, str):
             continue
@@ -276,7 +258,6 @@ def _remove_white_background_rects(frag_root):
             if "fill:#fff" in style or "fill:#ffffff" in style or "fill:white" in style:
                 to_remove.append(el)
                 continue
-            # try large width/height heuristic
             try:
                 w = float(el.get("width") or 0)
                 h = float(el.get("height") or 0)
@@ -289,11 +270,11 @@ def _remove_white_background_rects(frag_root):
         if parent is not None:
             parent.remove(r)
 
+# ---------- placeholders ----------
+def find_placeholders(svg_text: str):
+    return sorted(set(re.findall(r"\{\{\s*([A-Za-z0-9_\-\.]+)\s*\}\}", svg_text)))
+
 def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
-    """
-    Insert vector EAN-13 barcodes inline in place of {{placeholder}} text elements.
-    Applies dx/dy/scale from mapping and strips white background rects from barcode SVG.
-    """
     parser = etree.XMLParser(ns_clean=True, recover=True, remove_blank_text=True)
     root = etree.fromstring(svg_text.encode("utf-8"), parser=parser)
 
@@ -305,7 +286,6 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
         if not matches:
             continue
 
-        # only support single-placeholder->barcode substitution for vector insertion
         barcode_placeholders = [ph for ph in matches if mapping.get(ph, {}).get("type", "Text") == "Barcode EAN13"]
         if barcode_placeholders and len(matches) == 1:
             ph = barcode_placeholders[0]
@@ -313,21 +293,28 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
             col = cfg.get("col", ph)
             val = record.get(col, "")
             if val is None or str(val).strip() == "":
-                # clear text if empty
                 for child in list(text_elem):
                     text_elem.remove(child)
                 text_elem.text = ""
                 continue
 
-            # desired height mm -> px
+            # height and width mm (width_mm: 0 = auto)
             height_mm = float(cfg.get("height_mm", 25.0) or 25.0)
+            width_mm = float(cfg.get("width_mm", 0.0) or 0.0)
+
             try:
                 desired_h_px = utils.mm_to_px(height_mm)
             except Exception:
-                # if utils.mm_to_px missing fallback to 300 DPI
                 desired_h_px = int(round((height_mm / 25.4) * 300))
 
-            # text element position (numeric fallback to 0)
+            desired_w_px = None
+            if width_mm > 0:
+                try:
+                    desired_w_px = utils.mm_to_px(width_mm)
+                except Exception:
+                    desired_w_px = int(round((width_mm / 25.4) * 300))
+
+            # text element position
             x_val = text_elem.get("x") or text_elem.get("dx") or "0"
             y_val = text_elem.get("y") or text_elem.get("dy") or "0"
             try:
@@ -353,17 +340,16 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
             except Exception:
                 cfg_scale = 1.0
 
-            # Generate barcode SVG reliably here
+            # generate vector barcode svg
             try:
                 svg_bar = render_ean13_svg_text(val)
             except Exception as e:
-                # show error text inside SVG for easy diagnosis
                 for child in list(text_elem):
                     text_elem.remove(child)
                 text_elem.text = f"[barcode generate error: {e}]"
                 continue
 
-            # parse returned barcode svg fragment
+            # parse frag
             try:
                 parser2 = etree.XMLParser(ns_clean=True, recover=True, remove_blank_text=True)
                 frag = etree.fromstring(svg_bar.encode("utf-8"), parser=parser2)
@@ -373,27 +359,33 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 text_elem.text = f"[barcode svg parse error: {e}]"
                 continue
 
-            # remove any white background rectangles
+            # strip white background rects
             try:
                 _remove_white_background_rects(frag)
             except Exception:
                 pass
 
-            # compute scale to match requested height
+            # compute scale using requested width/height while preserving aspect ratio
             orig_w, orig_h = _parse_svg_dimensions(svg_bar)
-            if orig_h == 0:
+            if orig_h == 0 or orig_w == 0:
                 scale_by_height = 1.0
             else:
                 scale_by_height = float(desired_h_px) / float(orig_h)
 
+            if desired_w_px is not None and orig_w > 0:
+                scale_by_width = float(desired_w_px) / float(orig_w)
+                # preserve aspect ratio: choose the smaller scale so it fits both
+                chosen_scale = min(scale_by_width, scale_by_height)
+            else:
+                chosen_scale = scale_by_height
+
             total_tx = xf + cfg_dx
             total_ty = yf + cfg_dy
-            total_scale = scale_by_height * cfg_scale
+            total_scale = chosen_scale * cfg_scale
 
-            # create <g> with transform and import frag children
+            # build group and import children
             g = etree.Element("{http://www.w3.org/2000/svg}g")
             g.set("transform", f"translate({total_tx},{total_ty}) scale({total_scale})")
-            # import children from frag (skip outer <svg> wrapper)
             for child in list(frag):
                 frag.remove(child)
                 g.append(child)
@@ -404,9 +396,9 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 root.append(g)
             else:
                 parent.replace(text_elem, g)
-            continue  # proceed next node
+            continue
 
-        # fallback -> textual substitution for normal placeholders
+        # fallback textual substitution
         new_text = content
         for ph in matches:
             cfg = mapping.get(ph, {"col": ph, "align": "Left"})
@@ -416,7 +408,6 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 val = ""
             new_text = re.sub(r"\{\{\s*%s\s*\}\}" % re.escape(ph), str(val), new_text)
 
-        # remove child tspans and re-split lines preserving line structure
         for child in list(text_elem):
             text_elem.remove(child)
         lines = str(new_text).splitlines() or [""]
@@ -432,7 +423,6 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
         align_map = {"Left": "start", "Center": "middle", "Right": "end", "Justify": "start"}
         cfg0 = mapping.get(matches[0], {})
         text_elem.set("text-anchor", align_map.get(cfg0.get("align", "Left"), "start"))
-        # apply transform support (dx,dy,scale) on text
         try:
             dx = float(cfg0.get("dx", 0))
             dy = float(cfg0.get("dy", 0))
@@ -443,9 +433,9 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
         except Exception:
             pass
 
-    # convert back to string
     return etree.tostring(root, encoding="utf-8").decode("utf-8")
 
+# ---------- bundle helper ----------
 def bundle_zip(named_files: list[tuple[str, bytes]]) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -453,7 +443,7 @@ def bundle_zip(named_files: list[tuple[str, bytes]]) -> bytes:
             zf.writestr(fname, data)
     return buf.getvalue()
 
-# ---------- Main UI ----------
+# ---------- UI: upload template & data ----------
 col_tpl, col_data = st.columns([2,5])
 
 with col_tpl:
@@ -464,7 +454,6 @@ with col_data:
     data_file = st.file_uploader("CSV or XML", type=["csv", "xml"])
     st.caption("Template & Data are shown below (left: mapping, right: preview).")
 
-# session defaults
 if "preview_scale" not in st.session_state:
     st.session_state.preview_scale = 1.0
 if "mapping" not in st.session_state:
@@ -509,7 +498,7 @@ if data_file:
     except Exception as e:
         st.error(f"Failed to parse data file: {e}")
 
-# ---------- Read & sanitize template ----------
+# ---------- sanitize template ----------
 sanitized_template = None
 placeholders = []
 raw_svg_bytes = None
@@ -529,7 +518,7 @@ else:
     if svg_file:
         st.warning("Uploaded SVG invalid or could not be sanitized.")
 
-# ---------- Mapping UI & Preview ----------
+# ---------- Mapping UI ----------
 left_col, right_col = st.columns([2,5])
 
 with left_col:
@@ -560,7 +549,8 @@ with left_col:
                         "dy": float(r.get("dy", 0.0) or 0.0),
                         "scale": float(r.get("scale", 1.0) or 1.0),
                         "type": str(r.get("type", "Text")),
-                        "height_mm": float(r.get("height_mm", 25.0) or 25.0)
+                        "height_mm": float(r.get("height_mm", 25.0) or 25.0),
+                        "width_mm": float(r.get("width_mm", 0.0) or 0.0)
                     }
                 if newmap:
                     st.session_state.mapping = newmap
@@ -579,10 +569,10 @@ with left_col:
 
     try:
         csv_buf = io.StringIO()
-        csv_buf.write("placeholder,col,align,dx,dy,scale,type,height_mm\n")
+        csv_buf.write("placeholder,col,align,dx,dy,scale,type,height_mm,width_mm\n")
         for ph, cfg in current_mapping.items():
             csv_buf.write(
-                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)},{cfg.get('type','Text')},{cfg.get('height_mm',25.0)}\n"
+                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)},{cfg.get('type','Text')},{cfg.get('height_mm',25.0)},{cfg.get('width_mm',0.0)}\n"
             )
         st.download_button("Download mapping (CSV)", csv_buf.getvalue().encode("utf-8"), file_name="mapping.csv", help="Download current mapping as CSV")
     except Exception:
@@ -610,17 +600,25 @@ with left_col:
                 dy = st.number_input("dy (px)", value=float(prev.get("dy", 0.0)), step=0.5, format="%.1f", key=f"dy_{ph}")
                 scale = st.slider("scale", 0.1, 3.0, float(prev.get("scale", 1.0)), step=0.01, key=f"scale_{ph}")
 
-                # Type selector: Text or Barcode EAN13 (vector)
                 type_default = prev.get("type", "Text")
-                type_selected = st.selectbox("Type", ["Text", "Barcode EAN13"],
-                                            index=0 if type_default != "Barcode EAN13" else 1,
-                                            key=f"type_{ph}")
+                type_selected = st.selectbox("Type", ["Text", "Barcode EAN13"], index=0 if type_default != "Barcode EAN13" else 1, key=f"type_{ph}")
 
                 height_mm_val = prev.get("height_mm", 25.0)
+                width_mm_val = prev.get("width_mm", 0.0)
                 if type_selected == "Barcode EAN13":
                     height_mm_val = st.number_input("Barcode height (mm)", value=float(height_mm_val), step=0.5, key=f"height_mm_{ph}")
+                    width_mm_val = st.number_input("Barcode width (mm) — 0 = auto", value=float(width_mm_val), step=0.5, key=f"width_mm_{ph}")
 
-                st.session_state.mapping[ph] = {"col": col_selected, "align": align_selected, "dx": dx, "dy": dy, "scale": scale, "type": type_selected, "height_mm": float(height_mm_val)}
+                st.session_state.mapping[ph] = {
+                    "col": col_selected,
+                    "align": align_selected,
+                    "dx": dx,
+                    "dy": dy,
+                    "scale": scale,
+                    "type": type_selected,
+                    "height_mm": float(height_mm_val),
+                    "width_mm": float(width_mm_val)
+                }
         st.markdown('</div>', unsafe_allow_html=True)
         st.caption("Scroll to edit placeholders. Changes persist in this session.")
 
@@ -717,7 +715,7 @@ if st.button("Generate") and sanitized_template and df is not None and not df.em
     else:
         st.warning("No rows matched placeholders or no files were generated.")
 
-# Footer note for editors
+# Footer
 if role == "Editor":
     st.markdown("---")
     st.markdown("**Editor note:** Pin the preview to keep it visible while you scroll the page.")
