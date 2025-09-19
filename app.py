@@ -1,3 +1,4 @@
+# app.py  (UPDATED — EAN-13 barcode embedding support)
 ﻿# app.py
 import io
 import os
@@ -11,6 +12,10 @@ import pandas as pd
 import streamlit as st
 from lxml import etree
 import cairosvg
+
+# new imports for barcode integration
+import utils
+from PIL import Image as PILImage
 
 # ---------- App config ----------
 APP_TITLE = "Cuda Automation Layout"
@@ -197,14 +202,103 @@ def find_placeholders(svg_text: str):
     return sorted(set(re.findall(r"\{\{\s*([A-Za-z0-9_\-\.]+)\s*\}\}", svg_text)))
 
 def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
+    """
+    Modified apply_mapping_to_svg:
+    - For mapping entries where mapping[ph]['type'] == 'Barcode (EAN13)',
+      it generates a PNG data-URI using utils.render_barcode_png_bytes and replaces
+      the corresponding <text> node with an <image> element embedding that data URI.
+    - For regular text mapping, behavior is unchanged.
+    """
     parser = etree.XMLParser(ns_clean=True, recover=True, remove_blank_text=True)
     root = etree.fromstring(svg_text.encode("utf-8"), parser=parser)
+
     text_nodes = list(root.findall(".//{http://www.w3.org/2000/svg}text")) + list(root.findall(".//text"))
+
+    xlink_ns = "http://www.w3.org/1999/xlink"
+    added_xlink = False
+
     for text_elem in text_nodes:
+        # capture original textual content (including tspans)
         content = "".join(text_elem.itertext()) or ""
         matches = re.findall(r"\{\{\s*([A-Za-z0-9_\-\.]+)\s*\}\}", content)
         if not matches:
             continue
+
+        # We'll build the replacement content or element per match
+        # If multiple placeholders appear in same text element, we handle each sequentially:
+        # For barcode A: we replace the entire text element with a single <image> (best-effort).
+        # If multiple placeholders and any is Barcode we fallback to text substitution for others.
+        is_barcode_mode = any(mapping.get(ph, {}).get("type", "Text") == "Barcode (EAN13)" for ph in matches)
+
+        if is_barcode_mode and len(matches) == 1:
+            # single placeholder and it's a barcode -> replace text node with <image>
+            ph = matches[0]
+            cfg = mapping.get(ph, {"col": ph, "align": "Left"})
+            col = cfg.get("col", ph)
+            val = record.get(col, "")
+            if val is None:
+                val = ""
+            # if empty value, leave empty text
+            if str(val).strip() == "":
+                # remove children and set empty text
+                for child in list(text_elem):
+                    text_elem.remove(child)
+                text_elem.text = ""
+                continue
+
+            # determine barcode height in mm (default 25mm)
+            height_mm = float(cfg.get("height_mm", 25.0) or 25.0)
+            try:
+                png_bytes = utils.render_barcode_png_bytes(val, height_mm=height_mm)
+                # get dimensions
+                pil_img = PILImage.open(io.BytesIO(png_bytes))
+                w_px, h_px = pil_img.size
+                datauri = utils.png_bytes_to_data_uri(png_bytes)
+
+                # create image element
+                img_el = etree.Element("{http://www.w3.org/2000/svg}image")
+                # set both xlink:href and href for compatibility
+                img_el.set("{http://www.w3.org/1999/xlink}href", datauri)
+                img_el.set("href", datauri)
+                # position: try to reuse text x/y attributes if present; fall back to 0
+                x_val = text_elem.get("x") or text_elem.get("dx") or "0"
+                y_val = text_elem.get("y") or text_elem.get("dy") or "0"
+                img_el.set("x", str(x_val))
+                img_el.set("y", str(y_val))
+                img_el.set("width", str(w_px))
+                img_el.set("height", str(h_px))
+
+                # apply transform from mapping (dx,dy,scale)
+                try:
+                    dx = float(cfg.get("dx", 0))
+                    dy = float(cfg.get("dy", 0))
+                    scale = float(cfg.get("scale", 1.0))
+                    if dx != 0 or dy != 0 or scale != 1.0:
+                        img_el.set("transform", f"translate({dx},{dy}) scale({scale})")
+                except Exception:
+                    pass
+
+                # replace text_elem with img_el
+                parent = text_elem.getparent()
+                if parent is None:
+                    # can't replace, fallback to setting empty text and append image sibling
+                    text_elem.text = ""
+                    parent = text_elem.getparent()
+                    if parent is not None:
+                        parent.append(img_el)
+                else:
+                    parent.replace(text_elem, img_el)
+
+                # remember to ensure xmlns:xlink on root later
+                added_xlink = True
+            except Exception as e:
+                # generation failed -> keep text but insert error marker
+                for child in list(text_elem):
+                    text_elem.remove(child)
+                text_elem.text = f"[barcode error: {e}]"
+            continue  # move to next text node
+
+        # Fallback path: classic textual substitution (handles multi placeholders or non-barcode)
         new_text = content
         for ph in matches:
             cfg = mapping.get(ph, {"col": ph, "align": "Left"})
@@ -213,6 +307,7 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
             if val is None:
                 val = ""
             new_text = re.sub(r"\{\{\s*%s\s*\}\}" % re.escape(ph), str(val), new_text)
+
         # remove child tspans and re-split lines preserving line structure
         for child in list(text_elem):
             text_elem.remove(child)
@@ -238,6 +333,14 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
             text_elem.set("transform", (old + tf).strip())
         except Exception:
             pass
+
+    # ensure xlink namespace if we added xlink:href attributes
+    if added_xlink:
+        try:
+            root.set("xmlns:xlink", "http://www.w3.org/1999/xlink")
+        except Exception:
+            pass
+
     return etree.tostring(root, encoding="utf-8").decode("utf-8")
 
 def bundle_zip(named_files: list[tuple[str, bytes]]) -> bytes:
@@ -346,7 +449,7 @@ with left_col:
                 else:
                     st.error("JSON mapping must be an object mapping placeholder→config.")
             else:
-                # CSV: expect columns: placeholder,col,align,dx,dy,scale
+                # CSV: expect columns: placeholder,col,align,dx,dy,scale,type,height_mm
                 dfmap = pd.read_csv(io.BytesIO(raw))
                 newmap = {}
                 for _, r in dfmap.iterrows():
@@ -358,7 +461,9 @@ with left_col:
                         "align": str(r.get("align", "Left")),
                         "dx": float(r.get("dx", 0.0) or 0.0),
                         "dy": float(r.get("dy", 0.0) or 0.0),
-                        "scale": float(r.get("scale", 1.0) or 1.0)
+                        "scale": float(r.get("scale", 1.0) or 1.0),
+                        "type": str(r.get("type", "Text")),
+                        "height_mm": float(r.get("height_mm", 25.0) or 25.0)
                     }
                 if newmap:
                     st.session_state.mapping = newmap
@@ -379,14 +484,14 @@ with left_col:
         # ignore if mapping cannot be serialized
         pass
 
-    # CSV generation for mapping (placeholder,col,align,dx,dy,scale)
+    # CSV generation for mapping (placeholder,col,align,dx,dy,scale,type,height_mm)
     try:
         csv_buf = io.StringIO()
         # write header even if mapping empty
-        csv_buf.write("placeholder,col,align,dx,dy,scale\n")
+        csv_buf.write("placeholder,col,align,dx,dy,scale,type,height_mm\n")
         for ph, cfg in current_mapping.items():
             csv_buf.write(
-                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)}\n"
+                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)},{cfg.get('type','Text')},{cfg.get('height_mm',25.0)}\n"
             )
         st.download_button("Download mapping (CSV)", csv_buf.getvalue().encode("utf-8"), file_name="mapping.csv", help="Download current mapping as CSV")
     except Exception:
@@ -415,7 +520,17 @@ with left_col:
                 dx = st.number_input("dx (px)", value=float(prev.get("dx", 0.0)), step=0.5, format="%.1f", key=f"dx_{ph}")
                 dy = st.number_input("dy (px)", value=float(prev.get("dy", 0.0)), step=0.5, format="%.1f", key=f"dy_{ph}")
                 scale = st.slider("scale", 0.1, 3.0, float(prev.get("scale", 1.0)), step=0.01, key=f"scale_{ph}")
-                st.session_state.mapping[ph] = {"col": col_selected, "align": align_selected, "dx": dx, "dy": dy, "scale": scale}
+
+                # NEW: Type selector (Text or Barcode)
+                type_default = prev.get("type", "Text")
+                type_selected = st.selectbox("Type", ["Text", "Barcode (EAN13)"], index=0 if type_default not in ("Barcode (EAN13)",) else 1, key=f"type_{ph}")
+
+                # If barcode selected show barcode-specific inputs
+                height_mm_val = prev.get("height_mm", 25.0)
+                if type_selected == "Barcode (EAN13)":
+                    height_mm_val = st.number_input("Barcode height (mm)", value=float(height_mm_val), step=0.5, key=f"height_mm_{ph}")
+
+                st.session_state.mapping[ph] = {"col": col_selected, "align": align_selected, "dx": dx, "dy": dy, "scale": scale, "type": type_selected, "height_mm": float(height_mm_val)}
         st.markdown('</div>', unsafe_allow_html=True)
         st.caption("Scroll to edit placeholders. Changes persist in this session.")
 
@@ -521,4 +636,3 @@ if st.button("Generate") and sanitized_template and df is not None and not df.em
 if role == "Editor":
     st.markdown("---")
     st.markdown("**Editor note:** Pin the preview to keep it visible while you scroll the page.")
-
