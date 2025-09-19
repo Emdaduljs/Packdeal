@@ -1,4 +1,15 @@
 # app.py
+"""
+Packaging Design Automation — Streamlit app
+Features:
+- Robust CSV upload and parsing (no pandas)
+- Choose/upload SVG template(s) (assets/svg/)
+- Map CSV columns to SVG element IDs (text or image)
+- Generate per-row modified SVGs with embedded barcode PNGs (data URIs)
+- Preview row, download single SVG, or ZIP all generated SVGs
+- Pure-Pillow EAN-13 renderer (no python-barcode dependency)
+"""
+
 import base64
 import io
 import os
@@ -10,16 +21,16 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from PIL import Image, ImageDraw, ImageFont
 
+# ----------------- Setup paths -----------------
 ASSETS = Path("assets")
 SVG_DIR = ASSETS / "svg"
 SVG_DIR.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title="Packaging Design Automation", layout="wide")
-
 st.title("Packaging Design Automation — CSV → editable SVG template → Download")
 st.write("Upload CSV rows, pick an SVG layout, map CSV columns to SVG `id`s, preview and download the final files.")
 
-# ----------------- EAN13 pattern & PIL renderer (no external barcode lib) -----------------
+# ----------------- Pure-Pillow EAN-13 renderer -----------------
 def calculate_checksum_12(number12: str) -> str:
     s = 0
     for i, ch in enumerate(number12):
@@ -29,59 +40,45 @@ def calculate_checksum_12(number12: str) -> str:
     return str(check)
 
 def ean13_pattern(number13: str) -> str:
-    # returns string of '0'/'1' bits representing full barcode (95 modules)
-    # using standard L/G/R tables and parity
     codes = {
         "L": ["0001101","0011001","0010011","0111101","0100011","0110001","0101111","0111011","0110111","0001011"],
         "G": ["0100111","0110011","0011011","0100001","0011101","0111001","0000101","0010001","0001001","0010111"],
         "R": ["1110010","1100110","1101100","1000010","1011100","1001110","1010000","1000100","1001000","1110100"]
     }
-    parity = {
-        0:"LLLLLL",1:"LLGLGG",2:"LLGGLG",3:"LLGGGL",
-        4:"LGLLGG",5:"LGGLLG",6:"LGGGLL",7:"LGLGLG",
-        8:"LGLGGL",9:"LGGLGL"
-    }
-    # ensure digits only
+    parity = {0:"LLLLLL",1:"LLGLGG",2:"LLGGLG",3:"LLGGGL",4:"LGLLGG",5:"LGGLLG",6:"LGGGLL",7:"LGLGLG",8:"LGLGGL",9:"LGGLGL"}
     digits = "".join([c for c in number13 if c.isdigit()])
     if len(digits) == 12:
         digits = digits + calculate_checksum_12(digits)
     if len(digits) != 13:
-        raise ValueError("EAN13 needs 12 or 13 digits")
+        raise ValueError("EAN13 requires 12 or 13 digits")
     first = int(digits[0])
-    pattern_left = parity[first]
+    left_parity = parity[first]
     left_bits = ""
     for i in range(1,7):
-        left_bits += codes[pattern_left[i-1]][int(digits[i])]
+        left_bits += codes[left_parity[i-1]][int(digits[i])]
     right_bits = ""
     for i in range(7,13):
         right_bits += codes["R"][int(digits[i])]
-    full = "101" + left_bits + "01010" + right_bits + "101"
-    return full
+    return "101" + left_bits + "01010" + right_bits + "101"
 
 def generate_ean13_data_uri(ean_value: str, bar_height_px: int = 80, module_width_px: int = None, include_human_text: bool = True) -> str:
-    """
-    Create a PNG data URI with the EAN-13 bars drawn using Pillow.
-    - bar_height_px: height of bars in pixels (excluding human-readable text).
-    - module_width_px: if None will be chosen so overall barcode width ~ 190-350px.
-    """
     digits_only = "".join([c for c in ean_value if c.isdigit()])
     if len(digits_only) == 12:
         digits_only = digits_only + calculate_checksum_12(digits_only)
     if len(digits_only) != 13:
-        # produce small transparent placeholder to avoid breaking
-        im = Image.new("RGBA", (200, bar_height_px + 30), (255,255,255,0))
+        # return a transparent placeholder PNG data URI
+        im = Image.new("RGBA", (240, bar_height_px + 30), (255,255,255,0))
         buf = io.BytesIO(); im.save(buf, format="PNG"); return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
-    pattern = ean13_pattern(digits_only)  # 95 modules
-    modules = len(pattern)  # should be 95
+    pattern = ean13_pattern(digits_only)  # 95 bits
+    modules = len(pattern)  # expected 95
 
-    # Decide module width if not provided
     if not module_width_px:
-        # aim for width between 190 and 380 px
         target = 260
         module_width_px = max(1, int(round(target / modules)))
 
-    quiet_modules = int(10 * (1))  # quiet zone in modules (we'll multiply by module_width_px)
+    # choose quiet zone in modules (~10 modules recommended)
+    quiet_modules = 10
     q_px = quiet_modules * module_width_px
     total_w = modules * module_width_px + 2 * q_px
     text_area = 18 if include_human_text else 0
@@ -90,23 +87,16 @@ def generate_ean13_data_uri(ean_value: str, bar_height_px: int = 80, module_widt
     im = Image.new("RGBA", (total_w, img_h), (255,255,255,255))
     draw = ImageDraw.Draw(im)
 
-    # Draw bars
     x = q_px
-    # Optional guard extension: first 3, center guards, last 3 - make those taller
     for i, bit in enumerate(pattern):
         if bit == "1":
-            # determine if this module is part of guard sets:
             extend = False
-            # left-most guard bits: module positions 0..2 (in my "pattern" indexing these are inside "101" start)
-            # the standard guard indexes correspond when counting across the full 95 bits
-            # For simplicity, treat the initial and final 3 modules and center 5 modules as 'guard' extenders
             if i < 3 or (46 <= i <= 48) or i >= (modules - 3):
                 extend = True
             h = bar_height_px + (6 if extend else 0)
-            draw.rectangle([ (x, 0), (x + module_width_px - 1, h) ], fill=(0,0,0))
+            draw.rectangle(((x, 0), (x + module_width_px - 1, h)), fill=(0,0,0))
         x += module_width_px
 
-    # Human-readable text below (digits spaced)
     if include_human_text:
         try:
             font = ImageFont.truetype("DejaVuSans-Bold.ttf", 14)
@@ -117,22 +107,112 @@ def generate_ean13_data_uri(ean_value: str, bar_height_px: int = 80, module_widt
         tx = (total_w - w_text) // 2
         draw.text((tx, bar_height_px + 2), text, font=font, fill=(0,0,0))
 
-    # Convert to PNG and to data URI
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     data = buf.getvalue()
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
-# ----------------- SVG helpers (unchanged) -----------------
-def read_csv_file(uploaded_file) -> List[Dict[str,str]]:
+# ----------------- Robust CSV reader -----------------
+def read_csv_file(uploaded_file, force_delimiter: Optional[str] = None) -> List[Dict[str,str]]:
+    """
+    Robust CSV reader:
+    - Accepts uploaded_file (bytes or stream)
+    - Tries csv.Sniffer to detect dialect
+    - Pads short rows and extends header for extra columns (Extra_1..)
+    - Returns list of dicts with consistent keys
+    """
     uploaded_file.seek(0)
-    text = io.TextIOWrapper(uploaded_file, encoding="utf-8")
-    reader = csv.DictReader(text)
-    rows = [ {k: (v if v is not None else "") for k,v in r.items()} for r in reader ]
-    text.detach()
-    uploaded_file.seek(0)
-    return rows
+    raw = uploaded_file.read()
+    if isinstance(raw, bytes):
+        # handle BOM if any
+        try:
+            text = raw.decode("utf-8-sig")
+        except Exception:
+            text = raw.decode("utf-8", errors="replace")
+    else:
+        text = raw
 
+    # normalize newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    sample = text[:8192]
+    dialect = None
+    has_header = True
+    try:
+        if force_delimiter:
+            class SimpleDialect(csv.Dialect):
+                delimiter = force_delimiter
+                quotechar = '"'
+                doublequote = True
+                skipinitialspace = False
+                lineterminator = "\n"
+                quoting = csv.QUOTE_MINIMAL
+            dialect = SimpleDialect()
+        else:
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(sample)
+            has_header = sniffer.has_header(sample)
+    except Exception:
+        dialect = csv.excel
+
+    text_stream = io.StringIO(text)
+    reader = csv.reader(text_stream, dialect)
+
+    rows_list = []
+    try:
+        for r in reader:
+            rows_list.append([cell if cell is not None else "" for cell in r])
+    except Exception:
+        # fallback simple split
+        text_stream.seek(0)
+        rows_list = [line.split(",") for line in text_stream.read().splitlines()]
+
+    if not rows_list:
+        return []
+
+    # show debug info: counts per row (first 50)
+    counts_preview = [len(r) for r in rows_list[:50]]
+    st.caption("CSV row column counts (first 50 rows): " + ", ".join(str(x) for x in counts_preview))
+
+    # Determine header
+    if has_header:
+        header = [h if h is not None else "" for h in rows_list[0]]
+        data_rows = rows_list[1:]
+    else:
+        max_cols = max(len(r) for r in rows_list)
+        header = ["col_" + str(i+1) for i in range(max_cols)]
+        data_rows = rows_list
+
+    max_cols = max(len(header), max((len(r) for r in data_rows), default=0))
+    if len(header) < max_cols:
+        extra_needed = max_cols - len(header)
+        for i in range(extra_needed):
+            header.append("Extra_" + str(i+1))
+
+    normalized_rows = []
+    for r in data_rows:
+        if len(r) < max_cols:
+            r = r + [""] * (max_cols - len(r))
+        elif len(r) > max_cols:
+            r = r[:max_cols]
+        normalized_rows.append(r)
+
+    out = []
+    for r in normalized_rows:
+        d = {}
+        for i, h in enumerate(header):
+            key = (h if h is not None and h != "" else f"col_{i+1}")
+            d[key] = r[i]
+        out.append(d)
+
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    return out
+
+# ----------------- SVG Helpers -----------------
 def list_svg_templates() -> List[Path]:
     return sorted([p for p in SVG_DIR.glob("*.svg")])
 
@@ -169,23 +249,25 @@ def modify_svg(svg_bytes: bytes, mapping: Dict[str,str], row: Dict[str,str],
 
     for csv_col, elid in mapping.items():
         value = row.get(csv_col,"")
-        if not elid: continue
-        el = None
+        if not elid:
+            continue
+        target = None
         for node in root.iter():
             if node.attrib.get("id") == elid:
-                el = node
+                target = node
                 break
-        if el is not None:
-            if el.tag.lower().endswith("text") or '}' in el.tag and el.tag.split('}',1)[1]=='text':
-                for c in list(el):
-                    el.remove(c)
-                el.text = str(value)
+        if target is not None:
+            if target.tag.lower().endswith("text") or '}' in target.tag and target.tag.split('}',1)[1]=='text':
+                for c in list(target):
+                    target.remove(c)
+                target.text = str(value)
             else:
-                el.attrib['data-text'] = str(value)
+                target.attrib['data-text'] = str(value)
 
     for csv_col, (img_elid, height_px) in embed_barcode_map.items():
         ean_val = row.get(csv_col, "")
-        if not ean_val: continue
+        if not ean_val:
+            continue
         img_data = generate_ean13_data_uri(ean_val, bar_height_px=height_px)
         img_el = None
         for node in root.iter():
@@ -202,21 +284,29 @@ def modify_svg(svg_bytes: bytes, mapping: Dict[str,str], row: Dict[str,str],
     svg_out = ET.tostring(root, encoding="utf-8", method="xml")
     return svg_out
 
-# ----------------- App UI (unchanged behavior) -----------------
+# ----------------- App UI -----------------
 st.header("1. Upload CSV (rows to generate)")
-uploaded_csv = st.file_uploader("Upload CSV (first row header)", type=["csv"])
+uploaded_csv = st.file_uploader("Upload CSV (first row header)", type=["csv"], accept_multiple_files=False)
 if not uploaded_csv:
     st.info("Upload a CSV file first (sample in repo).")
     st.stop()
 
-rows = read_csv_file(uploaded_csv)
+# Option: force delimiter if detection fails
+force_delim = st.selectbox("Force delimiter (optional, leave '' to auto-detect)", options=["", ",", ";", "\t"], index=0)
+force_delim_chosen = force_delim if force_delim != "" else None
+
+rows = read_csv_file(uploaded_csv, force_delimiter=force_delim_chosen)
 if not rows:
     st.error("CSV has no rows or invalid format.")
     st.stop()
 st.success(f"Loaded {len(rows)} rows")
 
+# preview small table
 st.subheader("CSV preview")
-st.dataframe(rows[:5])
+try:
+    st.dataframe(rows[:10])
+except Exception:
+    st.write(rows[:10])
 
 st.header("2. Pick or upload an SVG template")
 col1, col2 = st.columns([2,1])
@@ -253,24 +343,24 @@ with col1:
 st.header("3. Map CSV columns to SVG element `id`s")
 ids = extract_ids_from_svg(svg_bytes)
 if not ids:
-    st.warning("No `id` attributes found in SVG. Add ids to text elements.")
+    st.warning("No `id` attributes found in SVG. To map text, ensure SVG text elements have `id` attributes in Illustrator or Inkscape.")
 else:
     st.write("Found SVG element `id`s (id : tag):")
     st.write(ids)
 
 csv_cols = list(rows[0].keys())
 
-st.subheader("Map fields")
+st.subheader("Map fields (text)")
 mapping: Dict[str,str] = {}
 for col in csv_cols:
     mapping[col] = st.selectbox(f"CSV column → SVG id for '{col}' (text)", options=[""] + [id for (id,tag) in ids], index=0, key=f"map_{col}")
 
-st.markdown("**Image embedding (barcode)** — map a CSV column that contains EAN13 to an `<image id='...'>` element in the SVG.")
+st.markdown("**Image embedding (barcode)** — map a CSV column that contains EAN13 to an `<image id='...'>` element in the SVG (the script will embed a PNG data URI).")
 embed_barcode_map = {}
 for col in csv_cols:
     img_el = st.selectbox(f"CSV column → image-id for '{col}' (barcode) (optional)", options=[""] + [id for (id,tag) in ids], index=0, key=f"embed_{col}")
     if img_el:
-        height_px = st.number_input(f"Barcode target height px for column '{col}'", value=80, min_value=10, key=f"embed_h_{col}")
+        height_px = st.number_input(f"Barcode target height px for column '{col}'", value=80, min_value=8, key=f"embed_h_{col}")
         embed_barcode_map[col] = (img_el, int(height_px))
 
 st.header("4. Preview a row and generate files")
@@ -284,18 +374,21 @@ try:
 except Exception:
     st.download_button("Download resulting SVG (preview) file", data=svg_result_bytes, file_name=f"preview_row{row_index}.svg")
 
+# single download
 st.download_button("Download this modified SVG", data=svg_result_bytes, file_name=f"row_{row_index}.svg", mime="image/svg+xml")
 
+# batch export
 if st.button("Generate all rows and download ZIP of SVGs"):
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
         for i, r in enumerate(rows):
             out_svg = modify_svg(svg_bytes, mapping, r, embed_barcode_map)
-            name = r.get(next(iter(r.keys()),"row"), f"row{i+1}")
-            name_san = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60]
+            # choose filename from first column or fallback
+            name_val = r.get(next(iter(r.keys()), "row"), f"row{i+1}")
+            name_san = "".join(c if c.isalnum() or c in "-_" else "_" for c in name_val)[:60]
             z.writestr(f"{i+1}_{name_san}.svg", out_svg)
     mem.seek(0)
     st.success("Generated ZIP with all templates.")
     st.download_button("Download generated SVGs (ZIP)", data=mem, file_name="generated_svgs.zip", mime="application/zip")
 
-st.info("SVGs are returned as edited SVG files. Open them in Illustrator/InkScape for raster export. If you want server-side PNG export, I can add that optionally.")
+st.info("SVGs are returned as edited SVG files. Open them in Illustrator/InkScape for raster export or printing. If you want server-side PNG export, I can add that (requires extra dependency like cairosvg).")
