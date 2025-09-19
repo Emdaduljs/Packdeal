@@ -1,8 +1,7 @@
 libcairo2
-libpango1.0-0
+libpango-1.0-0
 libgdk-pixbuf2.0-0
 libffi-dev
-# image build dependencies (ensure Pillow native features compile if needed)
 libjpeg-dev
 zlib1g-dev
 libtiff5-dev
@@ -10,3 +9,4 @@ libfreetype6-dev
 liblcms2-dev
 libwebp-dev
 libopenjp2-7-dev
+fontconfig
