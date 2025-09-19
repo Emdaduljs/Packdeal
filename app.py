@@ -13,7 +13,10 @@ import streamlit as st
 from lxml import etree
 import cairosvg
 
-# barcode utils (must be your updated utils.py with the new helpers)
+# barcode utils (make sure your utils.py exposes these functions):
+# - mm_to_px(mm)
+# - render_barcode_svg_text(ean: str) -> str   # returns SVG markup (no white background if possible)
+# - render_barcode_png_bytes(...) (not required anymore but may exist)
 import utils
 from PIL import Image as PILImage
 
@@ -189,7 +192,6 @@ def svg_to_pdf_bytes(svg_text: str) -> bytes:
 def _parse_svg_dimensions(svg_text: str):
     """
     Return (width_px, height_px) for an SVG string. Uses viewBox first, then width/height attrs.
-    Fallback is (1000, 1000).
     """
     try:
         parser = etree.XMLParser(ns_clean=True, recover=True, remove_blank_text=True)
@@ -233,12 +235,45 @@ def _parse_svg_dimensions(svg_text: str):
 def find_placeholders(svg_text: str):
     return sorted(set(re.findall(r"\{\{\s*([A-Za-z0-9_\-\.]+)\s*\}\}", svg_text)))
 
+def _remove_white_background_rects(frag_root):
+    """
+    Remove rect elements that appear to be white background covering the viewport.
+    Conservative: only removes <rect> with fill white-like or opacity=1 that span a large area.
+    """
+    to_remove = []
+    for el in list(frag_root.iter()):
+        if el.tag.lower().endswith("rect"):
+            fill = (el.get("fill") or "").strip().lower()
+            opacity = (el.get("opacity") or "").strip().lower()
+            # check fills that indicate white background
+            if fill in ("#fff", "#ffffff", "white", "rgb(255,255,255)") or fill == "":
+                # if fill blank, check style attribute
+                style = el.get("style") or ""
+                if "fill:#fff" in style or "fill:#ffffff" in style or "fill:white" in style:
+                    to_remove.append(el)
+                elif fill in ("#fff", "#ffffff", "white"):
+                    to_remove.append(el)
+            # also if explicit opacity 1 and very large rect (we can't measure exact dims reliably here)
+            # We'll remove rect that have width/height attributes equal to viewBox or large numbers:
+            try:
+                w = float(el.get("width") or 0)
+                h = float(el.get("height") or 0)
+                if w > 0 and h > 0 and (w > 500 or h > 500):
+                    # likely background (conservative)
+                    to_remove.append(el)
+            except Exception:
+                pass
+    for r in to_remove:
+        parent = r.getparent()
+        if parent is not None:
+            parent.remove(r)
+
 def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
     """
     Enhanced apply_mapping_to_svg:
      - Text substitution (default)
-     - Barcode (EAN13) (SVG): inserts inline vector barcode scaled to requested height(mm)
-     - Barcode (EAN13) (PNG): inserts <image> with explicit px width/height to avoid unit confusion
+     - Barcode EAN13: inserts inline vector barcode, strips white background rectangles,
+       scales to requested height (mm) and applies dx/dy/scale mapping transforms.
     """
     parser = etree.XMLParser(ns_clean=True, recover=True, remove_blank_text=True)
     root = etree.fromstring(svg_text.encode("utf-8"), parser=parser)
@@ -276,35 +311,56 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
             try:
                 xf = float(x_val)
             except Exception:
-                xf = None
+                xf = 0.0
             try:
                 yf = float(y_val)
             except Exception:
-                yf = None
+                yf = 0.0
+
+            # mapping adjustments
+            try:
+                cfg_dx = float(cfg.get("dx", 0) or 0)
+            except Exception:
+                cfg_dx = 0.0
+            try:
+                cfg_dy = float(cfg.get("dy", 0) or 0)
+            except Exception:
+                cfg_dy = 0.0
+            try:
+                cfg_scale = float(cfg.get("scale", 1.0) or 1.0)
+            except Exception:
+                cfg_scale = 1.0
 
             map_type = mapping.get(ph, {}).get("type", "Text")
 
-            # VECTOR SVG insertion
-            if map_type == "Barcode (EAN13) (SVG)":
+            # VECTOR insertion (only option now)
+            if map_type.startswith("Barcode"):
                 try:
                     svg_bar = utils.render_barcode_svg_text(val)
-                    orig_w, orig_h = _parse_svg_dimensions(svg_bar)
-                    if orig_h == 0:
-                        scale = 1.0
-                    else:
-                        scale = float(desired_h_px) / float(orig_h)
-
-                    # parse barcode svg fragment
+                    # parse barcode svg fragment to an Element
                     parser2 = etree.XMLParser(ns_clean=True, recover=True, remove_blank_text=True)
                     frag = etree.fromstring(svg_bar.encode("utf-8"), parser=parser2)
 
+                    # remove white background rects conservatively
+                    _remove_white_background_rects(frag)
+
+                    orig_w, orig_h = _parse_svg_dimensions(svg_bar)
+                    if orig_h == 0:
+                        scale_by_height = 1.0
+                    else:
+                        scale_by_height = float(desired_h_px) / float(orig_h)
+
+                    # Compose total transform:
+                    # place at (xf + cfg_dx, yf + cfg_dy) and scale = scale_by_height * cfg_scale
+                    total_tx = xf + cfg_dx
+                    total_ty = yf + cfg_dy
+                    total_scale = scale_by_height * cfg_scale
+
                     # create group and import children
                     g = etree.Element("{http://www.w3.org/2000/svg}g")
-                    tx = xf if xf is not None else 0
-                    ty = yf if yf is not None else 0
-                    g.set("transform", f"translate({tx},{ty}) scale({scale})")
+                    g.set("transform", f"translate({total_tx},{total_ty}) scale({total_scale})")
 
-                    # import children from frag (skip top-level attributes)
+                    # import children from frag (skip outer <svg> wrapper attributes)
                     for child in list(frag):
                         frag.remove(child)
                         g.append(child)
@@ -321,52 +377,7 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                     text_elem.text = f"[barcode svg error: {e}]"
                 continue
 
-            # RASTER PNG insertion
-            if map_type == "Barcode (EAN13) (PNG)":
-                try:
-                    png_bytes = utils.render_barcode_png_bytes(val, height_mm=height_mm)
-                    pil_img = PILImage.open(io.BytesIO(png_bytes))
-                    w_px, h_px = pil_img.size
-                    datauri = utils.png_bytes_to_data_uri(png_bytes)
-
-                    img_el = etree.Element("{http://www.w3.org/2000/svg}image")
-                    img_el.set("{http://www.w3.org/1999/xlink}href", datauri)
-                    img_el.set("href", datauri)
-                    if xf is not None:
-                        img_el.set("x", str(xf))
-                    else:
-                        img_el.set("x", str(x_val))
-                    if yf is not None:
-                        img_el.set("y", str(yf))
-                    else:
-                        img_el.set("y", str(y_val))
-                    img_el.set("width", f"{w_px}px")
-                    img_el.set("height", f"{h_px}px")
-
-                    try:
-                        dx = float(cfg.get("dx", 0))
-                        dy = float(cfg.get("dy", 0))
-                        scale = float(cfg.get("scale", 1.0))
-                        if dx != 0 or dy != 0 or scale != 1.0:
-                            img_el.set("transform", f"translate({dx},{dy}) scale({scale})")
-                    except Exception:
-                        pass
-
-                    parent = text_elem.getparent()
-                    if parent is None:
-                        text_elem.text = ""
-                        root.append(img_el)
-                    else:
-                        parent.replace(text_elem, img_el)
-
-                    added_xlink = True
-                except Exception as e:
-                    for child in list(text_elem):
-                        text_elem.remove(child)
-                    text_elem.text = f"[barcode png error: {e}]"
-                continue
-
-        # Fallback - textual substitution
+        # Fallback - textual substitution (handles multiple placeholders)
         new_text = content
         for ph in matches:
             cfg = mapping.get(ph, {"col": ph, "align": "Left"})
@@ -376,6 +387,7 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 val = ""
             new_text = re.sub(r"\{\{\s*%s\s*\}\}" % re.escape(ph), str(val), new_text)
 
+        # remove child tspans and re-split lines preserving line structure
         for child in list(text_elem):
             text_elem.remove(child)
         lines = str(new_text).splitlines() or [""]
@@ -391,16 +403,18 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
         align_map = {"Left": "start", "Center": "middle", "Right": "end", "Justify": "start"}
         cfg0 = mapping.get(matches[0], {})
         text_elem.set("text-anchor", align_map.get(cfg0.get("align", "Left"), "start"))
+        # transform support (dx,dy,scale) applied to text element
         try:
             dx = float(cfg0.get("dx", 0))
             dy = float(cfg0.get("dy", 0))
-            scale = float(cfg0.get("scale", 1.0))
+            scale_val = float(cfg0.get("scale", 1.0))
             old = text_elem.get("transform", "")
-            tf = f" translate({dx},{dy}) scale({scale})"
+            tf = f" translate({dx},{dy}) scale({scale_val})"
             text_elem.set("transform", (old + tf).strip())
         except Exception:
             pass
 
+    # xlink namespace not needed for vector barcodes, but keep safety
     if added_xlink:
         try:
             root.set("xmlns:xlink", "http://www.w3.org/1999/xlink")
@@ -511,6 +525,7 @@ with left_col:
                 else:
                     st.error("JSON mapping must be an object mapping placeholder→config.")
             else:
+                # CSV: expect columns: placeholder,col,align,dx,dy,scale,type,height_mm
                 dfmap = pd.read_csv(io.BytesIO(raw))
                 newmap = {}
                 for _, r in dfmap.iterrows():
@@ -576,14 +591,14 @@ with left_col:
                 dy = st.number_input("dy (px)", value=float(prev.get("dy", 0.0)), step=0.5, format="%.1f", key=f"dy_{ph}")
                 scale = st.slider("scale", 0.1, 3.0, float(prev.get("scale", 1.0)), step=0.01, key=f"scale_{ph}")
 
-                # Type selector: Text, Barcode (SVG), Barcode (PNG)
+                # Type selector: Text or Barcode EAN13 (vector only)
                 type_default = prev.get("type", "Text")
-                type_selected = st.selectbox("Type", ["Text", "Barcode (EAN13) (SVG)", "Barcode (EAN13) (PNG)"],
-                                            index=0 if type_default not in ("Barcode (EAN13) (SVG)", "Barcode (EAN13) (PNG)") else (1 if type_default == "Barcode (EAN13) (SVG)" else 2),
+                type_selected = st.selectbox("Type", ["Text", "Barcode EAN13"],
+                                            index=0 if type_default != "Barcode EAN13" else 1,
                                             key=f"type_{ph}")
 
                 height_mm_val = prev.get("height_mm", 25.0)
-                if type_selected != "Text":
+                if type_selected == "Barcode EAN13":
                     height_mm_val = st.number_input("Barcode height (mm)", value=float(height_mm_val), step=0.5, key=f"height_mm_{ph}")
 
                 st.session_state.mapping[ph] = {"col": col_selected, "align": align_selected, "dx": dx, "dy": dy, "scale": scale, "type": type_selected, "height_mm": float(height_mm_val)}
