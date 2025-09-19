@@ -1,0 +1,24 @@
+name: Deploy Streamlit App with Inkscape
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install Inkscape
+        run: ./install_inkscape.sh
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Deploy to Streamlit
+        run: streamlit run app.py
