@@ -1,6 +1,16 @@
 streamlit>=1.30,<2.0
 pandas>=2.1
-pillow==10.0.1
+Pillow>=11.0.0
+pillow-simd==0.0.0 # placeholder - remove if not used; keep only Pillow above
+pillow== # intentionally blank: use the Pillow>=11 line above
+pillow== # remove any other explicit old pins to prevent accidental installs
+pillow==
+
+
+pillow==
+
+
+# keep other package pins
 PyMuPDF>=1.22
 reportlab>=4.0
 cairosvg==2.7.0
