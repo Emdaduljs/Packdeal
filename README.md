@@ -1,11 +1,19 @@
-# Pacdora Clone (Full Structure - Example)
+# Packaging Design Automation (Streamlit)
 
-This repository is a scaffold for a Pacdora-like mockup generator, built as a Streamlit app.
-It includes simple working code for mapping a 2D design onto basic mockups (2D composites),
-plus PDF export. 3D models and dielines are included as placeholders for later replacement.
+A small Streamlit app that converts CSV rows into finished label PNG images (with barcode) and bundles them into a ZIP for quick download. Designed to speed packaging/label production.
 
-## How to run
+## Features
+- Upload CSV, map fields, preview one row
+- Generate barcode (EAN-13) as image and compose label with product details
+- Download all generated labels as a ZIP
+- Configurable label dimensions and DPI
 
+## Run locally
+1. Clone this repo
 ```bash
+git clone https://github.com/<you>/packaging-automation.git
+cd packaging-automation
+python -m venv .venv
+source .venv/bin/activate    # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
-streamlit run app.py
+streamlit run streamlit_app.py
