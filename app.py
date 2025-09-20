@@ -11,11 +11,11 @@ import streamlit as st
 from lxml import etree
 import cairosvg
 
-# barcode generation (vector) via python-barcode
+# barcode generation via python-barcode (SVGWriter)
 import barcode
 from barcode.writer import SVGWriter
 
-# keep using utils.mm_to_px
+# small utils module (must contain mm_to_px)
 import utils
 from PIL import Image as PILImage
 
@@ -298,21 +298,24 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 text_elem.text = ""
                 continue
 
-            # height and width mm (width_mm: 0 = auto)
-            height_mm = float(cfg.get("height_mm", 25.0) or 25.0)
+            # width_mm and height_mm behavior:
+            # - width_mm > 0 and height_mm == 0 -> scale by width only
+            # - height_mm > 0 and width_mm == 0 -> scale by height only
+            # - both > 0 -> fit inside both, preserving aspect ratio (min scale)
+            # - both == 0 -> no scale (orig size), only mapping 'scale' applied
+
+            height_mm = float(cfg.get("height_mm", 0.0) or 0.0)
             width_mm = float(cfg.get("width_mm", 0.0) or 0.0)
 
+            # px targets (None if not specified)
             try:
-                desired_h_px = utils.mm_to_px(height_mm)
+                desired_h_px = utils.mm_to_px(height_mm) if height_mm > 0 else None
             except Exception:
-                desired_h_px = int(round((height_mm / 25.4) * 300))
-
-            desired_w_px = None
-            if width_mm > 0:
-                try:
-                    desired_w_px = utils.mm_to_px(width_mm)
-                except Exception:
-                    desired_w_px = int(round((width_mm / 25.4) * 300))
+                desired_h_px = int(round((height_mm / 25.4) * 300)) if height_mm > 0 else None
+            try:
+                desired_w_px = utils.mm_to_px(width_mm) if width_mm > 0 else None
+            except Exception:
+                desired_w_px = int(round((width_mm / 25.4) * 300)) if width_mm > 0 else None
 
             # text element position
             x_val = text_elem.get("x") or text_elem.get("dx") or "0"
@@ -365,19 +368,30 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
             except Exception:
                 pass
 
-            # compute scale using requested width/height while preserving aspect ratio
+            # compute original dims
             orig_w, orig_h = _parse_svg_dimensions(svg_bar)
-            if orig_h == 0 or orig_w == 0:
-                scale_by_height = 1.0
+            # determine chosen_scale:
+            chosen_scale = 1.0
+            # case: neither specified -> keep original (scale 1.0)
+            if desired_w_px is None and desired_h_px is None:
+                chosen_scale = 1.0
+            # only width specified
+            elif desired_w_px is not None and desired_h_px is None:
+                if orig_w == 0:
+                    chosen_scale = 1.0
+                else:
+                    chosen_scale = float(desired_w_px) / float(orig_w)
+            # only height specified
+            elif desired_h_px is not None and desired_w_px is None:
+                if orig_h == 0:
+                    chosen_scale = 1.0
+                else:
+                    chosen_scale = float(desired_h_px) / float(orig_h)
+            # both specified -> fit inside box preserving aspect ratio
             else:
-                scale_by_height = float(desired_h_px) / float(orig_h)
-
-            if desired_w_px is not None and orig_w > 0:
-                scale_by_width = float(desired_w_px) / float(orig_w)
-                # preserve aspect ratio: choose the smaller scale so it fits both
-                chosen_scale = min(scale_by_width, scale_by_height)
-            else:
-                chosen_scale = scale_by_height
+                width_scale = float(desired_w_px) / float(orig_w) if orig_w != 0 else 1.0
+                height_scale = float(desired_h_px) / float(orig_h) if orig_h != 0 else 1.0
+                chosen_scale = min(width_scale, height_scale)
 
             total_tx = xf + cfg_dx
             total_ty = yf + cfg_dy
@@ -549,7 +563,7 @@ with left_col:
                         "dy": float(r.get("dy", 0.0) or 0.0),
                         "scale": float(r.get("scale", 1.0) or 1.0),
                         "type": str(r.get("type", "Text")),
-                        "height_mm": float(r.get("height_mm", 25.0) or 25.0),
+                        "height_mm": float(r.get("height_mm", 0.0) or 0.0),
                         "width_mm": float(r.get("width_mm", 0.0) or 0.0)
                     }
                 if newmap:
@@ -572,7 +586,7 @@ with left_col:
         csv_buf.write("placeholder,col,align,dx,dy,scale,type,height_mm,width_mm\n")
         for ph, cfg in current_mapping.items():
             csv_buf.write(
-                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)},{cfg.get('type','Text')},{cfg.get('height_mm',25.0)},{cfg.get('width_mm',0.0)}\n"
+                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)},{cfg.get('type','Text')},{cfg.get('height_mm',0.0)},{cfg.get('width_mm',0.0)}\n"
             )
         st.download_button("Download mapping (CSV)", csv_buf.getvalue().encode("utf-8"), file_name="mapping.csv", help="Download current mapping as CSV")
     except Exception:
@@ -603,10 +617,11 @@ with left_col:
                 type_default = prev.get("type", "Text")
                 type_selected = st.selectbox("Type", ["Text", "Barcode EAN13"], index=0 if type_default != "Barcode EAN13" else 1, key=f"type_{ph}")
 
-                height_mm_val = prev.get("height_mm", 25.0)
+                height_mm_val = prev.get("height_mm", 0.0)
                 width_mm_val = prev.get("width_mm", 0.0)
                 if type_selected == "Barcode EAN13":
-                    height_mm_val = st.number_input("Barcode height (mm)", value=float(height_mm_val), step=0.5, key=f"height_mm_{ph}")
+                    st.caption("Set either Width or Height (mm). Use 0 for auto. If both set, barcode will fit inside both preserving aspect ratio.")
+                    height_mm_val = st.number_input("Barcode height (mm) — 0 = auto", value=float(height_mm_val), step=0.5, key=f"height_mm_{ph}")
                     width_mm_val = st.number_input("Barcode width (mm) — 0 = auto", value=float(width_mm_val), step=0.5, key=f"width_mm_{ph}")
 
                 st.session_state.mapping[ph] = {
