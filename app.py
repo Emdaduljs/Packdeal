@@ -15,7 +15,7 @@ import cairosvg
 import barcode
 from barcode.writer import SVGWriter
 
-# small utils module (must contain mm_to_px)
+# utils must expose mm_to_px
 import utils
 from PIL import Image as PILImage
 
@@ -298,16 +298,15 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 text_elem.text = ""
                 continue
 
-            # width_mm and height_mm behavior:
-            # - width_mm > 0 and height_mm == 0 -> scale by width only
-            # - height_mm > 0 and width_mm == 0 -> scale by height only
-            # - both > 0 -> fit inside both, preserving aspect ratio (min scale)
-            # - both == 0 -> no scale (orig size), only mapping 'scale' applied
+            # width_mm / height_mm logic:
+            # - both >0 -> scale X & Y independently to match exactly (non-uniform)
+            # - only width >0 -> uniform scale to match width (height computed by ratio)
+            # - only height >0 -> uniform scale to match height (width computed by ratio)
+            # - both == 0 -> keep original barcode size (only mapping 'scale' multiplies)
 
             height_mm = float(cfg.get("height_mm", 0.0) or 0.0)
             width_mm = float(cfg.get("width_mm", 0.0) or 0.0)
 
-            # px targets (None if not specified)
             try:
                 desired_h_px = utils.mm_to_px(height_mm) if height_mm > 0 else None
             except Exception:
@@ -370,36 +369,47 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
 
             # compute original dims
             orig_w, orig_h = _parse_svg_dimensions(svg_bar)
-            # determine chosen_scale:
-            chosen_scale = 1.0
-            # case: neither specified -> keep original (scale 1.0)
+            # determine chosen scales
             if desired_w_px is None and desired_h_px is None:
-                chosen_scale = 1.0
-            # only width specified
+                # keep original; apply mapping scale only (uniform)
+                scale_x = cfg_scale
+                scale_y = cfg_scale
             elif desired_w_px is not None and desired_h_px is None:
+                # only width specified -> uniform scale by width
                 if orig_w == 0:
-                    chosen_scale = 1.0
+                    uniform = cfg_scale
                 else:
-                    chosen_scale = float(desired_w_px) / float(orig_w)
-            # only height specified
+                    uniform = (float(desired_w_px) / float(orig_w)) * cfg_scale
+                scale_x = uniform
+                scale_y = uniform
             elif desired_h_px is not None and desired_w_px is None:
+                # only height specified -> uniform scale by height
                 if orig_h == 0:
-                    chosen_scale = 1.0
+                    uniform = cfg_scale
                 else:
-                    chosen_scale = float(desired_h_px) / float(orig_h)
-            # both specified -> fit inside box preserving aspect ratio
+                    uniform = (float(desired_h_px) / float(orig_h)) * cfg_scale
+                scale_x = uniform
+                scale_y = uniform
             else:
-                width_scale = float(desired_w_px) / float(orig_w) if orig_w != 0 else 1.0
-                height_scale = float(desired_h_px) / float(orig_h) if orig_h != 0 else 1.0
-                chosen_scale = min(width_scale, height_scale)
+                # both specified -> non-uniform scaling to exactly match both
+                if orig_w == 0:
+                    sx = cfg_scale
+                else:
+                    sx = (float(desired_w_px) / float(orig_w)) * cfg_scale
+                if orig_h == 0:
+                    sy = cfg_scale
+                else:
+                    sy = (float(desired_h_px) / float(orig_h)) * cfg_scale
+                scale_x = sx
+                scale_y = sy
 
             total_tx = xf + cfg_dx
             total_ty = yf + cfg_dy
-            total_scale = chosen_scale * cfg_scale
 
             # build group and import children
             g = etree.Element("{http://www.w3.org/2000/svg}g")
-            g.set("transform", f"translate({total_tx},{total_ty}) scale({total_scale})")
+            # SVG transform supports scale(sx,sy)
+            g.set("transform", f"translate({total_tx},{total_ty}) scale({scale_x},{scale_y})")
             for child in list(frag):
                 frag.remove(child)
                 g.append(child)
@@ -612,7 +622,7 @@ with left_col:
                 align_selected = cols[1].selectbox("Align", ["Left", "Center", "Right"], index=align_index, key=f"align_{ph}")
                 dx = st.number_input("dx (px)", value=float(prev.get("dx", 0.0)), step=0.5, format="%.1f", key=f"dx_{ph}")
                 dy = st.number_input("dy (px)", value=float(prev.get("dy", 0.0)), step=0.5, format="%.1f", key=f"dy_{ph}")
-                scale = st.slider("scale", 0.1, 3.0, float(prev.get("scale", 1.0)), step=0.01, key=f"scale_{ph}")
+                scale = st.slider("scale", 0.1, 5.0, float(prev.get("scale", 1.0)), step=0.01, key=f"scale_{ph}")
 
                 type_default = prev.get("type", "Text")
                 type_selected = st.selectbox("Type", ["Text", "Barcode EAN13"], index=0 if type_default != "Barcode EAN13" else 1, key=f"type_{ph}")
@@ -620,7 +630,7 @@ with left_col:
                 height_mm_val = prev.get("height_mm", 0.0)
                 width_mm_val = prev.get("width_mm", 0.0)
                 if type_selected == "Barcode EAN13":
-                    st.caption("Set either Width or Height (mm). Use 0 for auto. If both set, barcode will fit inside both preserving aspect ratio.")
+                    st.caption("Set Width and/or Height (mm). Use 0 to auto. If both >0, the barcode will be scaled independently in X and Y to match exactly.")
                     height_mm_val = st.number_input("Barcode height (mm) — 0 = auto", value=float(height_mm_val), step=0.5, key=f"height_mm_{ph}")
                     width_mm_val = st.number_input("Barcode width (mm) — 0 = auto", value=float(width_mm_val), step=0.5, key=f"width_mm_{ph}")
 
