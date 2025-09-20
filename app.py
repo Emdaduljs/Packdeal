@@ -298,15 +298,39 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 text_elem.text = ""
                 continue
 
-            # width_mm / height_mm logic:
-            # - both >0 -> scale X & Y independently to match exactly (non-uniform)
-            # - only width >0 -> uniform scale to match width (height computed by ratio)
-            # - only height >0 -> uniform scale to match height (width computed by ratio)
-            # - both == 0 -> keep original barcode size (only mapping 'scale' multiplies)
-
+            # Read cfg values
             height_mm = float(cfg.get("height_mm", 0.0) or 0.0)
             width_mm = float(cfg.get("width_mm", 0.0) or 0.0)
+            ratio_mode = cfg.get("ratio_mode", "Exact")  # "Exact" or "Maintain"
 
+            # If ratio_mode == Maintain, attempt to compute missing side using stored ratio
+            ratio = cfg.get("ratio", None)
+            # if user provided both >0 and ratio_mode == Maintain -> compute/store fresh ratio
+            if ratio_mode == "Maintain":
+                if width_mm > 0 and height_mm > 0:
+                    # update stored ratio (width/height)
+                    try:
+                        cfg["ratio"] = float(width_mm) / float(height_mm)
+                        ratio = cfg["ratio"]
+                    except Exception:
+                        ratio = cfg.get("ratio", None)
+                else:
+                    # one side only set -> fill missing based on stored ratio (if possible)
+                    if ratio and width_mm == 0 and height_mm > 0:
+                        try:
+                            width_mm = float(height_mm) * float(ratio)
+                            cfg["width_mm"] = float(width_mm)
+                        except Exception:
+                            pass
+                    elif ratio and height_mm == 0 and width_mm > 0:
+                        try:
+                            height_mm = float(width_mm) / float(ratio)
+                            cfg["height_mm"] = float(height_mm)
+                        except Exception:
+                            pass
+                    # if ratio not present and both not >0, nothing to infer
+
+            # px targets (None means auto)
             try:
                 desired_h_px = utils.mm_to_px(height_mm) if height_mm > 0 else None
             except Exception:
@@ -369,46 +393,42 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
 
             # compute original dims
             orig_w, orig_h = _parse_svg_dimensions(svg_bar)
-            # determine chosen scales
+
+            # Decide scaling:
+            # - If desired_w_px and desired_h_px both None -> no size change (scale=cfg_scale)
+            # - If both specified -> non-uniform scale to match both exactly (scale_x, scale_y)
+            # - If only one specified -> uniform scale to match that side (other computed by orig ratio)
             if desired_w_px is None and desired_h_px is None:
-                # keep original; apply mapping scale only (uniform)
                 scale_x = cfg_scale
                 scale_y = cfg_scale
-            elif desired_w_px is not None and desired_h_px is None:
-                # only width specified -> uniform scale by width
+            elif desired_w_px is not None and desired_h_px is not None:
+                # both specified --> non-uniform exact match, then multiply by cfg_scale
+                sx = (float(desired_w_px) / float(orig_w)) if orig_w != 0 else 1.0
+                sy = (float(desired_h_px) / float(orig_h)) if orig_h != 0 else 1.0
+                scale_x = sx * cfg_scale
+                scale_y = sy * cfg_scale
+            elif desired_w_px is not None:
+                # width only -> uniform scale by width
                 if orig_w == 0:
-                    uniform = cfg_scale
+                    u = cfg_scale
                 else:
-                    uniform = (float(desired_w_px) / float(orig_w)) * cfg_scale
-                scale_x = uniform
-                scale_y = uniform
-            elif desired_h_px is not None and desired_w_px is None:
-                # only height specified -> uniform scale by height
-                if orig_h == 0:
-                    uniform = cfg_scale
-                else:
-                    uniform = (float(desired_h_px) / float(orig_h)) * cfg_scale
-                scale_x = uniform
-                scale_y = uniform
+                    u = (float(desired_w_px) / float(orig_w)) * cfg_scale
+                scale_x = u
+                scale_y = u
             else:
-                # both specified -> non-uniform scaling to exactly match both
-                if orig_w == 0:
-                    sx = cfg_scale
-                else:
-                    sx = (float(desired_w_px) / float(orig_w)) * cfg_scale
+                # height only -> uniform scale by height
                 if orig_h == 0:
-                    sy = cfg_scale
+                    u = cfg_scale
                 else:
-                    sy = (float(desired_h_px) / float(orig_h)) * cfg_scale
-                scale_x = sx
-                scale_y = sy
+                    u = (float(desired_h_px) / float(orig_h)) * cfg_scale
+                scale_x = u
+                scale_y = u
 
             total_tx = xf + cfg_dx
             total_ty = yf + cfg_dy
 
-            # build group and import children
+            # build group and import children - note: scale can be non-uniform
             g = etree.Element("{http://www.w3.org/2000/svg}g")
-            # SVG transform supports scale(sx,sy)
             g.set("transform", f"translate({total_tx},{total_ty}) scale({scale_x},{scale_y})")
             for child in list(frag):
                 frag.remove(child)
@@ -432,6 +452,7 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
                 val = ""
             new_text = re.sub(r"\{\{\s*%s\s*\}\}" % re.escape(ph), str(val), new_text)
 
+        # remove child tspans and re-split lines preserving line structure
         for child in list(text_elem):
             text_elem.remove(child)
         lines = str(new_text).splitlines() or [""]
@@ -447,6 +468,7 @@ def apply_mapping_to_svg(svg_text: str, mapping: dict, record: dict) -> str:
         align_map = {"Left": "start", "Center": "middle", "Right": "end", "Justify": "start"}
         cfg0 = mapping.get(matches[0], {})
         text_elem.set("text-anchor", align_map.get(cfg0.get("align", "Left"), "start"))
+        # transform support (dx,dy,scale) on text
         try:
             dx = float(cfg0.get("dx", 0))
             dy = float(cfg0.get("dy", 0))
@@ -574,7 +596,9 @@ with left_col:
                         "scale": float(r.get("scale", 1.0) or 1.0),
                         "type": str(r.get("type", "Text")),
                         "height_mm": float(r.get("height_mm", 0.0) or 0.0),
-                        "width_mm": float(r.get("width_mm", 0.0) or 0.0)
+                        "width_mm": float(r.get("width_mm", 0.0) or 0.0),
+                        "ratio_mode": str(r.get("ratio_mode", "Exact")),
+                        "ratio": float(r.get("ratio", 0.0) or 0.0)
                     }
                 if newmap:
                     st.session_state.mapping = newmap
@@ -593,10 +617,10 @@ with left_col:
 
     try:
         csv_buf = io.StringIO()
-        csv_buf.write("placeholder,col,align,dx,dy,scale,type,height_mm,width_mm\n")
+        csv_buf.write("placeholder,col,align,dx,dy,scale,type,height_mm,width_mm,ratio_mode,ratio\n")
         for ph, cfg in current_mapping.items():
             csv_buf.write(
-                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)},{cfg.get('type','Text')},{cfg.get('height_mm',0.0)},{cfg.get('width_mm',0.0)}\n"
+                f"{ph},{cfg.get('col','')},{cfg.get('align','Left')},{cfg.get('dx',0)},{cfg.get('dy',0)},{cfg.get('scale',1.0)},{cfg.get('type','Text')},{cfg.get('height_mm',0.0)},{cfg.get('width_mm',0.0)},{cfg.get('ratio_mode','Exact')},{cfg.get('ratio',0.0)}\n"
             )
         st.download_button("Download mapping (CSV)", csv_buf.getvalue().encode("utf-8"), file_name="mapping.csv", help="Download current mapping as CSV")
     except Exception:
@@ -627,12 +651,56 @@ with left_col:
                 type_default = prev.get("type", "Text")
                 type_selected = st.selectbox("Type", ["Text", "Barcode EAN13"], index=0 if type_default != "Barcode EAN13" else 1, key=f"type_{ph}")
 
-                height_mm_val = prev.get("height_mm", 0.0)
-                width_mm_val = prev.get("width_mm", 0.0)
+                # Precompute values for height/width/ration handling
+                prev_height = float(prev.get("height_mm", 0.0) or 0.0)
+                prev_width  = float(prev.get("width_mm", 0.0) or 0.0)
+                prev_ratio_mode = prev.get("ratio_mode", "Exact")
+                prev_ratio = prev.get("ratio", None)
+
+                # if maintain ratio mode and ratio exists, pre-fill missing side for user's convenience
+                height_mm_val = prev_height
+                width_mm_val = prev_width
+                ratio_mode_selected = prev_ratio_mode
+
                 if type_selected == "Barcode EAN13":
-                    st.caption("Set Width and/or Height (mm). Use 0 to auto. If both >0, the barcode will be scaled independently in X and Y to match exactly.")
+                    # Allow user to choose ratio behaviour
+                    ratio_mode_selected = st.selectbox("Resize behaviour", ["Exact", "Maintain ratio"], index=0 if prev_ratio_mode != "Maintain" else 1, key=f"ratio_mode_{ph}")
+
+                    # if Maintain ratio and ratio present, auto compute missing side
+                    if ratio_mode_selected == "Maintain":
+                        # If user previously set a ratio, apply it to fill missing field for UI
+                        if prev_ratio and (prev_ratio != 0):
+                            if prev_width == 0 and prev_height > 0:
+                                width_mm_val = prev_height * float(prev_ratio)
+                            elif prev_height == 0 and prev_width > 0:
+                                height_mm_val = prev_width / float(prev_ratio)
+                        # If both present and user chooses maintain, show as-is; ratio will be stored after inputs below
+
+                    st.caption("Set Width and/or Height (mm). Use 0 to auto. If 'Maintain ratio' selected: after you set both the ratio is stored — later single-side edits will auto compute the other side by that ratio.")
                     height_mm_val = st.number_input("Barcode height (mm) — 0 = auto", value=float(height_mm_val), step=0.5, key=f"height_mm_{ph}")
-                    width_mm_val = st.number_input("Barcode width (mm) — 0 = auto", value=float(width_mm_val), step=0.5, key=f"width_mm_{ph}")
+                    width_mm_val  = st.number_input("Barcode width (mm) — 0 = auto", value=float(width_mm_val), step=0.5, key=f"width_mm_{ph}")
+                else:
+                    # clear barcode-specific fields for non-barcode
+                    ratio_mode_selected = prev.get("ratio_mode", "Exact")
+                    height_mm_val = 0.0
+                    width_mm_val = 0.0
+
+                # save mapping and manage ratio storage/derivation
+                # If Maintain ratio and both set (>0) compute & store ratio
+                store_ratio = prev.get("ratio", None)
+                if type_selected == "Barcode EAN13" and ratio_mode_selected == "Maintain":
+                    if width_mm_val > 0 and height_mm_val > 0:
+                        try:
+                            store_ratio = float(width_mm_val) / float(height_mm_val)
+                        except Exception:
+                            store_ratio = prev.get("ratio", None)
+                    else:
+                        # if only one side set and we have previous ratio, we auto-filled above for UI; ensure store_ratio remains
+                        store_ratio = prev.get("ratio", store_ratio)
+                else:
+                    # if not maintain mode, clear stored ratio to avoid accidental reuse
+                    store_ratio = prev.get("ratio", None) if prev.get("ratio", None) is not None and ratio_mode_selected == prev.get("ratio_mode", "Exact") else prev.get("ratio", None)
+                    # we won't modify it if user switches back to Exact — leaving stored ratio harmless
 
                 st.session_state.mapping[ph] = {
                     "col": col_selected,
@@ -642,7 +710,9 @@ with left_col:
                     "scale": scale,
                     "type": type_selected,
                     "height_mm": float(height_mm_val),
-                    "width_mm": float(width_mm_val)
+                    "width_mm": float(width_mm_val),
+                    "ratio_mode": str(ratio_mode_selected),
+                    "ratio": float(store_ratio) if store_ratio is not None else None
                 }
         st.markdown('</div>', unsafe_allow_html=True)
         st.caption("Scroll to edit placeholders. Changes persist in this session.")
